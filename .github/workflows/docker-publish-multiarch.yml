@@ -1,0 +1,201 @@
+name: Build and publish multi-arch image
+
+# Publishes ghcr.io/inframaniacs/turnstone as a true multi-arch manifest list
+# (linux/amd64 + linux/arm64).
+#
+# WHY THIS FORK WORKFLOW EXISTS
+#
+# Upstream's docker-publish.yml calls docker/build-push-action with no
+# `platforms:` input, so it builds only the runner's architecture and publishes
+# an index containing linux/amd64 alone. Anything scheduling Turnstone onto an
+# arm64 node — common on bare metal and Talos, and on any mixed cloud pool —
+# then gets a pod that dies in CrashLoopBackOff with `exec format error`,
+# intermittently, in proportion to how much of the pool is arm64. That reads
+# like a flaky deploy rather than an image problem, which is what makes it
+# expensive to diagnose.
+#
+# NATIVE RUNNERS, NOT QEMU
+#
+# The obvious fix is `platforms: linux/amd64,linux/arm64` on the existing step,
+# which builds the second architecture under QEMU emulation. That is a bad trade
+# for THIS image specifically: the Dockerfile runs `uv sync --extra all` twice
+# and then `python -m compileall` over the whole virtualenv. Those are
+# interpreter-bound, and emulated they are slow enough to risk the job timeout —
+# before considering any dependency that lacks an arm64 wheel and falls back to
+# compiling from source.
+#
+# So each architecture builds natively on its own runner and the two
+# single-arch images are joined into one manifest list with `imagetools create`.
+# If GitHub-hosted arm64 runners ever stop being available here, the fallback is
+# a single job with docker/setup-qemu-action plus `platforms:` on the build step,
+# and a much longer wall clock.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit to build (e.g. v1.8.3)"
+        required: true
+        type: string
+
+concurrency:
+  # Never cancel mid-push: an interrupted manifest merge can leave the registry
+  # with per-arch digests pushed and no manifest list referencing them.
+  group: docker-multiarch-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: inframaniacs/turnstone
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Set platform tag pair
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Resolve version
+        id: version
+        env:
+          REF: ${{ inputs.ref || github.ref_name }}
+        run: |
+          # Image tags carry no leading `v`, matching upstream's own convention
+          # and what docker/metadata-action would produce.
+          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # push-by-digest: each arch lands as an unnamed digest, and only the
+          # merge job below creates the tag. A tag therefore never exists
+          # pointing at a half-built set of architectures.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # Scoped per platform: one shared scope would have the two runners
+          # evicting each other's layers on every build.
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifest list
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve version
+        id: version
+        env:
+          REF: ${{ inputs.ref || github.ref_name }}
+        run: echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Every per-arch digest has to land as its own argv entry. The usual
+          # recipe gets that from an unquoted command substitution, which works
+          # but trips shellcheck SC2046 and mangles any value containing
+          # whitespace. Build a real array instead.
+          #
+          # Only the exact version is tagged. No :latest or :stable — this fork
+          # exists to add an architecture, not to assert a release line, and a
+          # moving alias here would invite the floating-tag failure the platform
+          # repo explicitly forbids.
+          digest_args=()
+          for digest in *; do
+            digest_args+=("${IMAGE_REF}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create \
+            -t "${IMAGE_REF}:${VERSION}" \
+            "${digest_args[@]}"
+
+      - name: Verify both architectures are present
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # A manifest list with one architecture is the exact bug this
+          # workflow exists to prevent, and it is silent — the pull succeeds on
+          # amd64 and fails only once a pod lands on an arm64 node. Fail here
+          # instead.
+          docker buildx imagetools inspect "${IMAGE_REF}:${VERSION}" --raw > manifest.json
+          cat manifest.json
+          for arch in amd64 arm64; do
+            if ! grep -q "\"architecture\": *\"${arch}\"" manifest.json; then
+              echo "::error::linux/${arch} missing from the published manifest list"
+              exit 1
+            fi
+          done
+          echo "both architectures present"

@@ -26,7 +26,22 @@ jobs:
     # packages:write.  Only same-repo tag pushes may publish images; CI's
     # push trigger matches main/dev/stable/* and v* tags, so a head_branch
     # starting with "v" is necessarily a tag run.
+    #
+    # FORK DIVERGENCE (InfraManiacs/turnstone): the repository guard below is
+    # added here and is the ONLY change to this file.
+    #
+    # This job builds a single architecture (no `platforms:` on the build step)
+    # and its IMAGE_NAME is `${{ github.repository }}`, which lowercases to the
+    # same ghcr.io/inframaniacs/turnstone that docker-publish-multiarch.yml
+    # publishes. Left enabled in this fork, both would fire on the same `v*`
+    # tag and whichever finished last would win — frequently replacing a real
+    # multi-arch manifest list with an amd64-only one, silently, since the
+    # resulting image still pulls fine on amd64.
+    #
+    # Guarding on the repository rather than deleting the file keeps it
+    # byte-comparable with upstream, so a future merge is a no-op here.
     if: >-
+      github.repository == 'turnstonelabs/turnstone' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
